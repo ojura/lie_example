@@ -2,24 +2,28 @@
 #include <manif/SE3.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <random>
-#include <nav_msgs/Path.h>
+#include <nav_msgs/msg/path.hpp>
 
-int main(int argc, char** argv){
-  ros::init(argc, argv, "lie_test");
-  ros::NodeHandle n;
+class LieNode : public rclcpp::Node {
+public:
+    LieNode() : Node("lie_node") { };
+};
 
-  ros::Rate r(20);
+int main(int argc, char** argv) {
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<LieNode>();
 
-  tf2_ros::TransformBroadcaster br;
+  rclcpp::Rate r(20);
 
-  ros::Time start = ros::Time::now();
+  tf2_ros::TransformBroadcaster br(node);
 
+  rclcpp::Time start = node->now();
 
-  geometry_msgs::TransformStamped tf, tf_drifty;
+  geometry_msgs::msg::TransformStamped tf, tf_drifty;
   tf.header.frame_id = "map";
   tf.child_frame_id = "base_link";
   tf_drifty = tf;
-  tf_drifty.child_frame_id = "base_link_drify";
+  tf_drifty.child_frame_id = "base_link_drifty";
 
   // manif::SE3d a{manif::SE3d::Translation{1, 1, 0}, manif::SO3d::Identity()};
   manif::SE3d b{manif::SE3d::Translation{10, 0, 0}, manif::SO3d(Eigen::AngleAxisd(M_PI_2, Eigen::Vector3d::UnitZ()))};
@@ -37,10 +41,10 @@ int main(int argc, char** argv){
   std::default_random_engine generator;
   std::normal_distribution<double> dist(0, 1);
 
-  ros::Publisher path_pub = ros::NodeHandle().advertise<nav_msgs::Path>("path", 10, true);
-  nav_msgs::Path path;
+  auto path_pub = node->create_publisher<nav_msgs::msg::Path>("path", 10);
+  nav_msgs::msg::Path path;
   path.header.frame_id = "map";
-  path.header.stamp = ros::Time();
+  path.header.stamp = rclcpp::Time();
 
   double bias[6];
   for (int i = 0; i < 6; i++) {
@@ -49,8 +53,8 @@ int main(int argc, char** argv){
 
   const double delta_t = M_PI_4 * (8. / (503./4.));
   double t = 0;
-  while(n.ok()) {
-      ros::Time now = ros::Time::now();
+  while(rclcpp::ok()) {
+    rclcpp::Time now = node->now();
     tf.header.stamp = now;
     tf_drifty.header.stamp = now;
 
@@ -90,10 +94,10 @@ int main(int argc, char** argv){
         tf_current->transform.rotation.z = pose_current->quat().z();
         tf_current->transform.rotation.w = pose_current->quat().w();
 
-        if (i == 0) {
+        if (i == 1) {
             path.poses.emplace_back();
             path.poses.back().header.frame_id = "base_link";
-            path.poses.back().header.stamp = ros::Time();
+            path.poses.back().header.stamp = rclcpp::Time();
 
             path.poses.back().pose.position.x = pose_current->translation().x();
             path.poses.back().pose.position.y = pose_current->translation().y();
@@ -104,7 +108,7 @@ int main(int argc, char** argv){
             path.poses.back().pose.orientation.z = pose_current->quat().z();
             path.poses.back().pose.orientation.w = pose_current->quat().w();
 
-            path_pub.publish(path);
+            path_pub->publish(path);
         }
 
         br.sendTransform(*tf_current);
@@ -116,8 +120,7 @@ int main(int argc, char** argv){
     t_prev = t;
     t += delta_t;
     r.sleep();
-
   }
 
-  ros::spin();
+  rclcpp::spin(node);
 }
