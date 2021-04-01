@@ -22,6 +22,56 @@ void SE3ToGeometryMsgsPose(
   pose_stamped.pose.orientation.w = pose.quat().w();
 }
 
+template <typename _LieGroup>
+class ConstraintFunctor
+{
+  using LieGroup = _LieGroup;
+  using Tangent  = typename _LieGroup::Tangent;
+
+  template <typename _Scalar>
+  using LieGroupTemplate = typename LieGroup::template LieGroupTemplate<_Scalar>;
+
+  template <typename _Scalar>
+  using TangentTemplate = typename Tangent::template TangentTemplate<_Scalar>;
+
+ public:
+  MANIF_MAKE_ALIGNED_OPERATOR_NEW_COND_TYPE(Tangent)
+
+  template <typename... Args>
+  ConstraintFunctor(double omega_scale, Args&&... args)
+      : measurement_(std::forward<Args>(args)...), omega_scale_(omega_scale)
+  { }
+
+  template<typename T>
+  bool operator()(const T* const past_raw,
+                  const T* const futur_raw,
+                  T* residuals_raw) const
+  {
+    const Eigen::Map<const LieGroupTemplate<T>> state_past(past_raw);
+    const Eigen::Map<const LieGroupTemplate<T>> state_future(futur_raw);
+
+    Eigen::Map<TangentTemplate<T>> residuals(residuals_raw);
+
+    /// r = m - ( future (-) past )
+    residuals = measurement_.template cast<T>() - (state_future - state_past);
+    residuals.coeffs().template tail<3>() *= T(omega_scale_);
+
+    /// r = exp( log(m)^-1 . ( past^-1 . future ) )
+
+//    residuals =
+//      measurement_.exp().template cast<T>()
+//        .between(state_past.between(state_future)).log();
+
+    return true;
+  }
+
+ private:
+  Tangent measurement_;
+  double omega_scale_;
+};
+
+using SE3Constraint = ConstraintFunctor<manif::SE3d>;
+
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<LieNode>();
@@ -64,6 +114,9 @@ int main(int argc, char** argv) {
   nav_msgs::msg::Path path;
   path.header.frame_id = "map";
   path.header.stamp = rclcpp::Time();
+  auto path_gt = path;
+  path.poses.reserve(600);
+  path_gt.poses.reserve(600);
 
   double bias[6];
   for (int i = 0; i < 6; i++) {
@@ -106,6 +159,14 @@ int main(int argc, char** argv) {
     pose_drifty = pose_drifty + c_log_drift;
     poses_drifty.push_back(pose_drifty);
 
+    path.poses.emplace_back();
+    SE3ToGeometryMsgsPose(pose_drifty, path.poses.back());
+    path_pub->publish(path);
+
+    path_gt.poses.emplace_back();
+    SE3ToGeometryMsgsPose(pose, path_gt.poses.back());
+    path_gt_pub->publish(path_gt);
+
     auto* pose_current = &pose;
     auto* tf_current = &tf;
 
@@ -126,10 +187,9 @@ int main(int argc, char** argv) {
 
     t_prev = t;
     t += delta_t;
-    // r.sleep();
+    r.sleep();
   }
 
-  auto path_gt = path;
   path_gt.poses.resize(poses_ground_truth.size());
   for (int i = 0; i < poses_ground_truth.size(); i++) {
     SE3ToGeometryMsgsPose(poses_ground_truth[i], path_gt.poses.at(i));
@@ -150,24 +210,19 @@ int main(int argc, char** argv) {
 
   for (int i = 1; i < poses_drifty.size(); i++) {
     problem.AddResidualBlock(
-        new ceres::AutoDiffCostFunction<
-            manif::CeresConstraintFunctor<manif::SE3d>, 6, 7, 7>(
-            new manif::CeresConstraintSE3(poses_drifty[i] -
-                                          poses_drifty[i - 1])),
+        new ceres::AutoDiffCostFunction<SE3Constraint, 6, 7, 7>(
+            new SE3Constraint(10., poses_drifty[i] - poses_drifty[i - 1])),
         nullptr, poses_to_be_optimized[i - 1].data(),
         poses_to_be_optimized[i].data());
   }
 
   problem.AddResidualBlock(
-      new ceres::AutoDiffCostFunction<manif::CeresConstraintSE3, 6, 7, 7>(
-          new manif::CeresConstraintSE3(manif::SE3d::Tangent::Zero())),
-      nullptr,
-      poses_to_be_optimized.back().data(),
+      new ceres::AutoDiffCostFunction<SE3Constraint, 6, 7, 7>(
+          new SE3Constraint(10., manif::SE3d::Tangent::Zero())),
+      nullptr, poses_to_be_optimized.back().data(),
       poses_to_be_optimized[0].data());
 
   // Run the solver!
-  path.poses.resize(poses_to_be_optimized.size());
-
   struct IterationCallbackFunctor : public ceres::IterationCallback {
     std::function<void(void)> callback;
 
@@ -179,15 +234,15 @@ int main(int argc, char** argv) {
 
   IterationCallbackFunctor iteration_callback;
   iteration_callback.callback = [&]() {
-      for (int i = 0; i < poses_to_be_optimized.size(); i++) {
-       SE3ToGeometryMsgsPose(poses_to_be_optimized[i], path.poses.at(i));
-      }
+    for (int i = 0; i < poses_to_be_optimized.size(); i++) {
+      SE3ToGeometryMsgsPose(poses_to_be_optimized[i], path.poses.at(i));
+    }
     for (int i = 0; i < 50; i++) {
-        path_pub->publish(path);
-        path_gt_pub->publish(path_gt);
-        r.sleep();
-      }
-    };
+      path_pub->publish(path);
+      path_gt_pub->publish(path_gt);
+      r.sleep();
+    }
+  };
   iteration_callback.callback();
 
   ceres::Solver::Summary summary;
