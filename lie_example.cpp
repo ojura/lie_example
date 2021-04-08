@@ -6,6 +6,7 @@
 #include <ceres/ceres.h>
 #include <manif/SE3.h>
 #include <manif/ceres/ceres.h>
+#include <visualization_msgs/msg/marker.hpp>
 
 class LieNode : public rclcpp::Node {
  public:
@@ -34,31 +35,33 @@ void SE3ToTransformMsg(
   transform_stamped.transform.rotation.w = pose.quat().w();
 }
 
-template <typename _LieGroup>
-class ConstraintFunctor
-{
-  using LieGroup = _LieGroup;
-  using Tangent  = typename _LieGroup::Tangent;
+void TranslationToPoint(
+    const manif::SE3d::Translation& translation, geometry_msgs::msg::Point& point) {
+  point.x = translation.x();
+  point.y = translation.y();
+  point.z = translation.z();
+}
 
-  template <typename _Scalar>
-  using LieGroupTemplate = typename LieGroup::template LieGroupTemplate<_Scalar>;
+template <typename LieGroup>
+class ConstraintFunctor {
+  using Tangent = typename LieGroup::Tangent;
 
-  template <typename _Scalar>
-  using TangentTemplate = typename Tangent::template TangentTemplate<_Scalar>;
+  template <typename Scalar>
+  using LieGroupTemplate = typename LieGroup::template LieGroupTemplate<Scalar>;
+
+  template <typename Scalar>
+  using TangentTemplate = typename Tangent::template TangentTemplate<Scalar>;
 
  public:
   MANIF_MAKE_ALIGNED_OPERATOR_NEW_COND_TYPE(Tangent)
 
   template <typename... Args>
   ConstraintFunctor(double omega_scale, Args&&... args)
-      : measurement_(std::forward<Args>(args)...), omega_scale_(omega_scale)
-  { }
+      : measurement_(std::forward<Args>(args)...), omega_scale_(omega_scale) {}
 
-  template<typename T>
-  bool operator()(const T* const past_raw,
-                  const T* const futur_raw,
-                  T* residuals_raw) const
-  {
+  template <typename T>
+  bool operator()(const T* const past_raw, const T* const futur_raw,
+                  T* residuals_raw) const {
     const Eigen::Map<const LieGroupTemplate<T>> state_past(past_raw);
     const Eigen::Map<const LieGroupTemplate<T>> state_future(futur_raw);
 
@@ -70,25 +73,71 @@ class ConstraintFunctor
 
     /// r = exp( log(m)^-1 . ( past^-1 . future ) )
 
-//    residuals =
-//      measurement_.exp().template cast<T>()
-//        .between(state_past.between(state_future)).log();
+    //    residuals =
+    //      measurement_.exp().template cast<T>()
+    //        .between(state_past.between(state_future)).log();
 
     return true;
   }
 
  private:
-  Tangent measurement_;
-  double omega_scale_;
+  const Tangent measurement_;
+  const double omega_scale_;
+};
+
+
+template <typename LieGroup>
+class ObservationFunctor
+{
+  using Tangent  = typename LieGroup::Tangent;
+
+  template <typename Scalar>
+  using LieGroupTemplate = typename LieGroup::template LieGroupTemplate<Scalar>;
+
+  template <typename Scalar>
+  using TangentTemplate = typename Tangent::template TangentTemplate<Scalar>;
+
+ public:
+  MANIF_MAKE_ALIGNED_OPERATOR_NEW_COND_TYPE(Tangent)
+
+  template <typename... Args>
+  ObservationFunctor(double scale, const Eigen::Vector3d& landmark, Args&&... args)
+      : landmark_(landmark), observation_(std::forward<Args>(args)...), scale_(scale)
+  { }
+
+  template<typename T>
+  bool operator()(const T* const pose_raw,
+                  T* residual_raw) const {
+    const Eigen::Map<const LieGroupTemplate<T>> pose(pose_raw);
+
+    Eigen::Map<Eigen::Matrix<T, 3, 1>> residual(residual_raw);
+
+    /// r = m - ( future (-) past )
+    residual = T(scale_) * (pose.act(observation_.template cast<T>()) - landmark_.template cast<T>());
+
+    /// r = exp( log(m)^-1 . ( past^-1 . future ) )
+
+    //    residuals =
+    //      measurement_.exp().template cast<T>()
+    //        .between(state_past.between(state_future)).log();
+
+    return true;
+  }
+
+ private:
+  const Eigen::Vector3d& landmark_;
+  const Eigen::Vector3d observation_;
+  double scale_;
 };
 
 using SE3Constraint = ConstraintFunctor<manif::SE3d>;
+using SE3Observation = ObservationFunctor<manif::SE3d>;
 
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<LieNode>();
 
-  rclcpp::Rate r(20);
+  rclcpp::Rate r(200);
 
   tf2_ros::TransformBroadcaster br(node);
   tf2_ros::StaticTransformBroadcaster br_static(node);
@@ -102,7 +151,6 @@ int main(int argc, char** argv) {
   tf_drifty = tf;
   tf_drifty.child_frame_id = "base_link_drifty";
 
-
   std::vector<manif::SE3d::Translation> landmarks;
   landmarks.reserve(3);
 
@@ -110,8 +158,8 @@ int main(int argc, char** argv) {
   auto& axis_tf = static_tfs.back();
   axis_tf.header.frame_id = "map";
   axis_tf.child_frame_id = "axis";
-  manif::SE3d global_rotation_axis_location{
-      manif::SE3d::Translation{30, 30, 0}, manif::SO3d::Identity()};
+  manif::SE3d global_rotation_axis_location{manif::SE3d::Translation{30, 30, 0},
+                                            manif::SO3d::Identity()};
   SE3ToTransformMsg(global_rotation_axis_location, axis_tf);
 
   static_tfs.emplace_back();
@@ -137,18 +185,27 @@ int main(int argc, char** argv) {
 
   br_static.sendTransform(static_tfs);
 
+  struct Observation {
+    int landmark;
+    int pose_id;
+    Eigen::Vector3d relative_position;
+  };
+
+  std::vector<Observation> observations;
+
   // manif::SE3d a{manif::SE3d::Translation{1, 1, 0}, manif::SO3d::Identity()};
   manif::SE3d initial_with_respect_to_axis{
       manif::SE3d::Translation{10, 0, 0},
       manif::SO3d(Eigen::AngleAxisd(M_PI_2, Eigen::Vector3d::UnitZ()))};
-  manif::SE3d pose_with_respect_to_axis = initial_with_respect_to_axis;  // manif::SE3d::Identity();
-  manif::SE3d pose = global_rotation_axis_location * initial_with_respect_to_axis;
+  manif::SE3d pose_with_respect_to_axis =
+      initial_with_respect_to_axis;  // manif::SE3d::Identity();
+  manif::SE3d pose =
+      global_rotation_axis_location * initial_with_respect_to_axis;
   manif::SE3d pose_prev = pose;
   manif::SE3d pose_drifty = manif::SE3d::Identity();
 
   std::cout << "SE3d " << pose << " coeffs " << pose.coeffs() << " size "
             << pose.coeffs().size() << std::endl;
-
 
   manif::SE3d::Tangent c_log;
   //                   v,      w
@@ -160,6 +217,8 @@ int main(int argc, char** argv) {
 
   auto path_pub = node->create_publisher<nav_msgs::msg::Path>("path", 10);
   auto path_gt_pub = node->create_publisher<nav_msgs::msg::Path>("path_gt", 10);
+  auto marker_pub = node->create_publisher<visualization_msgs::msg::Marker>(
+      "observations", 10);
   nav_msgs::msg::Path path;
   path.header.frame_id = "map";
   path.header.stamp = rclcpp::Time();
@@ -177,6 +236,18 @@ int main(int argc, char** argv) {
   std::vector<manif::SE3d> poses_ground_truth, poses_drifty;
   poses_ground_truth.reserve(600);
   poses_drifty.reserve(600);
+
+  visualization_msgs::msg::Marker observations_marker;
+  observations_marker.header.frame_id = "map";
+  observations_marker.type = visualization_msgs::msg::Marker::LINE_LIST;
+  observations_marker.color.a = 1.0;
+  observations_marker.color.r = 1.0;
+  observations_marker.color.g = 1.0;
+  observations_marker.scale.x = 0.1;
+  observations_marker.scale.y = 0.1;
+
+  int pose_id = 0;
+  int count_to_observations_moment = 0;
   while (rclcpp::ok()) {
     rclcpp::Time now = node->now();
     tf.header.stamp = now;
@@ -189,7 +260,8 @@ int main(int argc, char** argv) {
     c_log.coeffs()(2) = std::sin(t / 4);
 
     pose_prev = pose;
-    pose_with_respect_to_axis = (t - t_prev) * c_log + pose_with_respect_to_axis;
+    pose_with_respect_to_axis =
+        (t - t_prev) * c_log + pose_with_respect_to_axis;
     pose = global_rotation_axis_location * pose_with_respect_to_axis;
 
     poses_ground_truth.push_back(pose);
@@ -204,6 +276,23 @@ int main(int argc, char** argv) {
     for (int i = 3; i < 6; i++) {
       auto& coeff = c_log_drift.coeffs()(i);
       coeff += w_norm * (0.03 * bias[i] + 0.003 * dist(generator));
+    }
+
+    if (count_to_observations_moment == 0) {
+      for (int l = 0; l < landmarks.size(); l++) {
+        observations.emplace_back(
+            Observation{l, pose_id, pose.inverse().act(landmarks[l])});
+        observations_marker.points.emplace_back();
+        TranslationToPoint(pose.translation(),
+                           observations_marker.points.back());
+        observations_marker.points.emplace_back();
+        TranslationToPoint(pose.act(observations.back().relative_position),
+                           observations_marker.points.back());
+        for (int i = 0; i < 3; i++) {
+          observations.back().relative_position(i) += 0.03 * dist(generator);
+        }
+      }
+      marker_pub->publish(observations_marker);
     }
 
     pose_drifty = pose_drifty + c_log_drift;
@@ -229,8 +318,15 @@ int main(int argc, char** argv) {
 
     t_prev = t;
     t += delta_t;
+    count_to_observations_moment++;
+    pose_id++;
+    if (count_to_observations_moment == 30) {
+      count_to_observations_moment = 0;
+    }
     r.sleep();
   }
+
+  std::cout << "Number of poses: " << poses_ground_truth.size() << std::endl;
 
   path_gt.poses.resize(poses_ground_truth.size());
   for (int i = 0; i < poses_ground_truth.size(); i++) {
@@ -292,6 +388,21 @@ int main(int argc, char** argv) {
   solver_options.update_state_every_iteration = true;
   solver_options.minimizer_progress_to_stdout = true;
   solver_options.callbacks.push_back(&iteration_callback);
+  ceres::Solve(solver_options, &problem, &summary);
+  std::cout << summary.BriefReport() << "\n";
+
+  std::cout << "--------------" << std::endl;
+  std::cout << "Adding observation residuals" << std::endl;
+
+  for (const auto& observation : observations) {
+    problem.AddResidualBlock(
+        new ceres::AutoDiffCostFunction<SE3Observation, 3, 7>(
+            new SE3Observation(10., landmarks[observation.landmark],
+                               observation.relative_position)),
+        nullptr, poses_to_be_optimized[observation.pose_id].data());
+  }
+
+  problem.SetParameterBlockVariable(poses_to_be_optimized[0].data());
   ceres::Solve(solver_options, &problem, &summary);
   std::cout << summary.BriefReport() << "\n";
 
