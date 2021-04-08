@@ -1,5 +1,6 @@
 #include <iostream>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include <random>
 #include <nav_msgs/msg/path.hpp>
 #include <ceres/ceres.h>
@@ -20,6 +21,17 @@ void SE3ToGeometryMsgsPose(
   pose_stamped.pose.orientation.y = pose.quat().y();
   pose_stamped.pose.orientation.z = pose.quat().z();
   pose_stamped.pose.orientation.w = pose.quat().w();
+}
+
+void SE3ToTransformMsg(
+    const manif::SE3d& pose, geometry_msgs::msg::TransformStamped& transform_stamped) {
+  transform_stamped.transform.translation.x = pose.translation().x();
+  transform_stamped.transform.translation.y = pose.translation().y();
+  transform_stamped.transform.translation.z = pose.translation().z();
+  transform_stamped.transform.rotation.x = pose.quat().x();
+  transform_stamped.transform.rotation.y = pose.quat().y();
+  transform_stamped.transform.rotation.z = pose.quat().z();
+  transform_stamped.transform.rotation.w = pose.quat().w();
 }
 
 template <typename _LieGroup>
@@ -79,27 +91,64 @@ int main(int argc, char** argv) {
   rclcpp::Rate r(20);
 
   tf2_ros::TransformBroadcaster br(node);
+  tf2_ros::StaticTransformBroadcaster br_static(node);
 
   rclcpp::Time start = node->now();
 
   geometry_msgs::msg::TransformStamped tf, tf_drifty;
+  std::vector<geometry_msgs::msg::TransformStamped> static_tfs;
   tf.header.frame_id = "map";
   tf.child_frame_id = "base_link";
   tf_drifty = tf;
   tf_drifty.child_frame_id = "base_link_drifty";
 
+
+  std::vector<manif::SE3d::Translation> landmarks;
+  landmarks.reserve(3);
+
+  static_tfs.emplace_back();
+  auto& axis_tf = static_tfs.back();
+  axis_tf.header.frame_id = "map";
+  axis_tf.child_frame_id = "axis";
+  manif::SE3d global_rotation_axis_location{
+      manif::SE3d::Translation{30, 30, 0}, manif::SO3d::Identity()};
+  SE3ToTransformMsg(global_rotation_axis_location, axis_tf);
+
+  static_tfs.emplace_back();
+  auto& lm1 = static_tfs.back();
+  lm1.header.frame_id = "map";
+  lm1.child_frame_id = "lm1";
+  landmarks.emplace_back(40, 40, 5);
+  SE3ToTransformMsg({landmarks.back(), manif::SO3d::Identity()}, lm1);
+
+  static_tfs.emplace_back();
+  auto& lm2 = static_tfs.back();
+  lm2.header.frame_id = "map";
+  lm2.child_frame_id = "lm2";
+  landmarks.emplace_back(30, 30 - 10 * sqrt(2), 0);
+  SE3ToTransformMsg({landmarks.back(), manif::SO3d::Identity()}, lm2);
+
+  static_tfs.emplace_back();
+  auto& lm3 = static_tfs.back();
+  lm3.header.frame_id = "map";
+  lm3.child_frame_id = "lm3";
+  landmarks.emplace_back(20, 20, 10);
+  SE3ToTransformMsg({landmarks.back(), manif::SO3d::Identity()}, lm3);
+
+  br_static.sendTransform(static_tfs);
+
   // manif::SE3d a{manif::SE3d::Translation{1, 1, 0}, manif::SO3d::Identity()};
-  manif::SE3d b{
+  manif::SE3d initial_with_respect_to_axis{
       manif::SE3d::Translation{10, 0, 0},
       manif::SO3d(Eigen::AngleAxisd(M_PI_2, Eigen::Vector3d::UnitZ()))};
-  manif::SE3d pose = b;  // manif::SE3d::Identity();
-  manif::SE3d pose_prev = b;
-  manif::SE3d pose_drifty = b;  // manif::SE3d::Identity();
+  manif::SE3d pose_with_respect_to_axis = initial_with_respect_to_axis;  // manif::SE3d::Identity();
+  manif::SE3d pose = global_rotation_axis_location * initial_with_respect_to_axis;
+  manif::SE3d pose_prev = pose;
+  manif::SE3d pose_drifty = manif::SE3d::Identity();
 
   std::cout << "SE3d " << pose << " coeffs " << pose.coeffs() << " size "
             << pose.coeffs().size() << std::endl;
 
-  // Angeles Jorge
 
   manif::SE3d::Tangent c_log;
   //                   v,      w
@@ -140,7 +189,8 @@ int main(int argc, char** argv) {
     c_log.coeffs()(2) = std::sin(t / 4);
 
     pose_prev = pose;
-    pose = (t - t_prev) * c_log + pose;
+    pose_with_respect_to_axis = (t - t_prev) * c_log + pose_with_respect_to_axis;
+    pose = global_rotation_axis_location * pose_with_respect_to_axis;
 
     poses_ground_truth.push_back(pose);
 
@@ -171,15 +221,7 @@ int main(int argc, char** argv) {
     auto* tf_current = &tf;
 
     for (int i = 0; i < 2; i++) {
-      tf_current->transform.translation.x = pose_current->translation().x();
-      tf_current->transform.translation.y = pose_current->translation().y();
-      tf_current->transform.translation.z = pose_current->translation().z();
-
-      tf_current->transform.rotation.x = pose_current->quat().x();
-      tf_current->transform.rotation.y = pose_current->quat().y();
-      tf_current->transform.rotation.z = pose_current->quat().z();
-      tf_current->transform.rotation.w = pose_current->quat().w();
-
+      SE3ToTransformMsg(*pose_current, *tf_current);
       br.sendTransform(*tf_current);
       pose_current = &pose_drifty;
       tf_current = &tf_drifty;
